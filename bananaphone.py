@@ -124,6 +124,11 @@ from itertools   import islice, imap
 from collections import deque
 from cocotools   import cmap, cfilter, coroutine, composable, cdebug, cmapstar, tee, coThreadWithQueueAccess, pv
 
+try:
+    from twisted.internet import protocol
+except:
+    print "Twisted Python is not installed"
+
 HASHES  = [ md5, sha1, sha224, sha256, sha384, sha512 ]
 GLOBALS = globals()
 
@@ -741,6 +746,22 @@ class usage ( composable ):
         composable.__init__( self, _command )
 
 
+def callFromThreadWrapper( fn ):
+    def _callFromThreadWrapper( *args, **kwargs ):
+        reactor.callFromThread( fn, *args, **kwargs )
+    return _callFromThreadWrapper
+
+
+class ByteSinkProtocol ( protocol.Protocol ):
+
+    def dataReceived(self, data):
+        self.byteSink.send( data )
+
+    def connectionLost(self, why):
+        debug( "Connection lost." )
+        self.loseRemoteConnection()
+
+
 @register( COMMANDS, 'tcp_proxy' )
 @usage
 def tcp_proxy ( listenPort, destHostPort, codecName, *args ):
@@ -754,27 +775,12 @@ def tcp_proxy ( listenPort, destHostPort, codecName, *args ):
     from twisted.protocols import basic
     from twisted.internet  import reactor, protocol, defer
 
-    def callFromThreadWrapper( fn ):
-        def _callFromThreadWrapper( *args, **kwargs ):
-            reactor.callFromThread( fn, *args, **kwargs )
-        return _callFromThreadWrapper
-
-    class ByteSinkProtocol ( protocol.Protocol ):
-
-        def dataReceived(self, data):
-            self.byteSink.send( data )
-
-        def connectionLost(self, why):
-            debug( "Connection lost." )
-            self.loseRemoteConnection()
-
 
     class ProxyClient ( ByteSinkProtocol ):
 
         def connectionMade(self):
             debug( "Outbound connection established" )
             self.factory.proxyServer.clientConnectionMade( self )
-
 
     class ProxyClientFactory( protocol.ClientFactory ):
 
@@ -786,7 +792,6 @@ def tcp_proxy ( listenPort, destHostPort, codecName, *args ):
         def clientConnectionFailed( self, connector, reason ):
             debug( "Connection failed: %s %s" % (connector, reason) )
             self.proxyServer.transport.loseConnection()
-
 
     class ProxyServer( ByteSinkProtocol ):
 
@@ -808,7 +813,6 @@ def tcp_proxy ( listenPort, destHostPort, codecName, *args ):
             for byte in data:
                 self.byteSink.send( byte )
 
-
     class ProxyServerFactory ( protocol.Factory ):
 
         protocol = ProxyServer
@@ -818,10 +822,138 @@ def tcp_proxy ( listenPort, destHostPort, codecName, *args ):
             self.codec        = codec
 
     codec = GLOBALS.get( codecName )
-    assert codec in CODECS, "codec must be one of %s, got %s" % ( formatGlobalNames( CODECS ), codecName )
+    assert codec in CODECS, "codec must be one of %s, got %s" \
+        % ( formatGlobalNames( CODECS ), codecName )
     
-    reactor.listenTCP( int(listenPort), ProxyServerFactory( destHostPort, codec(*args) ) )
+    reactor.listenTCP( int(listenPort), 
+                       ProxyServerFactory( destHostPort, codec(*args) ) )
     reactor.run()
+
+
+@register( COMMANDS, 'socks_proxy')
+@usage
+def socks_proxy( listenPort, destHostPort, codecName, *args ):
+    """
+    listenPort   - TCP port number to listen on
+    destHostPort - host:port to connect to
+    codecName    - name of encoder/decoder pair to use
+    codecArgs    - codec parameters
+    """
+    import struct
+    from twisted.internet import reactor, protocol, tcp
+    from twisted.protocols, import socks
+
+    def socksify( socksHost, socksPort ):
+        """
+        Overrides reactor.connectTCP with a Socks4a version.
+        """
+        def connectTCP( host, port, factory, timeout=120 ):
+            conn = tcp.Connector( socksHost, socksPort, 
+                                  Socks4aClientFactory( host, port, factory ), 
+                                  timeout, None, reactor )
+            conn.connect()
+            return conn
+        reactor.connectTCP = connectTCP
+
+    class Socks4aClient( socks.SOCKSv4 ):
+        
+        def sendSocks4aConnect( self, host, port ):
+            """
+            Creates a Python string representation of a Socks4a protocol 
+            C struct.
+
+            Client struct format:
+            Field 1: SOCKS version number
+            Field 2: Command code
+            Field 3: Port number, in network byte order
+            Field 4: Deliberately invalid IP address (0.0.0.1)
+            Field 5: User ID string, terminated by NULL
+            Field 6: Domain name of the Socks4a host to connect to,
+                     also terminated with a NULL
+            """
+            structFormat              = '>BBHIB'
+            socksVersion              = 4
+            establishTCPIPStream      = 1
+            establishTCPIPPortBinding = 2
+            invalidIPaddr             = 1
+            userID                    = 0
+            null                      = '\x00'
+            
+            connreq = (struct.pack( structFormat, socksVersion, 
+                                    establishTCPIPStream, port, invalidIPaddr, 
+                                    userID, ) + host + null)
+            self.transport.write(msg)
+
+        def handleSocks4aResponse( self, response ):
+            version, command, dstPort, dstIP = struct.unpack('>BBHI', response)
+            assert version == 4
+            if command == 90:
+                pass
+            elif command == 91:
+                debug("Socks4a request rejected or failed.")
+            elif command == 92:
+                debug("Socks4a request rejected: no identd.")
+            elif command == 93:
+                debug("Socks4a request rejected: identd doesn't match.")
+            else:
+                debug("Unknown Socks4a response.")
+        
+        def dataReceived( self, data ):
+            """
+            Called whenever data, all or part of a Socks4a packet, is received.
+            """
+            assert not self.finished
+
+            if self.connection:
+                self.connection.write( data )
+                return
+
+            if not self.connection:
+                self.buf = self.buf + data
+                if len( self.buf ) >= 8:
+                    response, self.buf = self.buf[:8], self.buf[8:]
+                    self.handleSocks4aResponse( response )
+                    self.connected = True
+            if self.connected:
+                peeraddr = "??"
+                p = self.factory.upper_factory.buildProtocol( peeraddr )
+
+                ## Move the transport to the real protocol object
+                self.transport.protocol = p
+                
+                ## Attach the real protocol to the transport
+                p.makeConnection( self.transport )
+                
+                ## Send any leftover data
+                if self.buf:
+                    p.dataReceived( self.buf )
+
+                ## Fix up the connector to point to the new factory, so
+                ## things like clientConnectionLost go to the right place
+                self.transport.connector.factory = self.factory.upper_factory
+
+                ## We should be disconnected now
+                self.finished = True
+
+    class Socks4aClientFactory( protocol.Factory ):
+
+        protocol = Socks4aClient
+        
+        def __init__( self, destHostPort, codec ):
+            self.destHostPort = destHostPort
+            self.codec        = codec
+        
+
+    class Socks4aServer( ByteSinkProtocol ):
+        
+        def connectionMade( self ):
+            self.transport.pauseProducing()
+            host, port = self.factory.destHostPort.split(':')
+            debug("Incoming connection established")
+            
+
+    class Socks4aServerFactory( protocol.Factory ):
+        pass
 
 
 @register( COMMANDS, 'test' )
